@@ -112,7 +112,7 @@ double MIC_OFFSET_DB = MIC_OFFSET_DEFAULT;
 
 // Credenciales de la página de calibración (HTTP Basic Auth)
 const char* CAL_USER = "admin";
-const char* CAL_PASS = "calibrar";   // cambiar por seguridad
+const char* CAL_PASS = "password";   // cambiar por seguridad
 
 // Con muestras normalizadas a -1.0..+1.0, MIC_REF_AMPL no lleva el factor entero
 const double MIC_REF_AMPL = pow(10.0, MIC_SENSITIVITY / 20.0);
