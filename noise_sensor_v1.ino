@@ -82,7 +82,7 @@ static i2s_chan_handle_t rx_handle = NULL;
 const char* MQTT_HOST = "192.168.1.100";   // IP o dominio del broker
 const int   MQTT_PORT = 1883;
 const char* MQTT_USER = "usuario";          // usuario del broker (o "" si no usa auth)
-const char* MQTT_PASS = "contrasena";       // contraseña del broker
+const char* MQTT_PASS = "password";       // contraseña del broker
 
 const int PUBLISH_MS  = 2000;
 #define   RESET_PIN   0
