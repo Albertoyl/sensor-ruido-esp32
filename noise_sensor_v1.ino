@@ -899,3 +899,4 @@ void loop() {
     min_dB  = 999;
   }
 }
+//Lmax: envolvente Fast (IEC 61672-1) en vez de muestra cruda + flag DEBUG_TIMING
