@@ -82,7 +82,7 @@ static i2s_chan_handle_t rx_handle = NULL;
 const char* MQTT_HOST = "192.168.1.100";   // IP o dominio del broker
 const int   MQTT_PORT = 1883;
 const char* MQTT_USER = "usuario";          // usuario del broker (o "" si no usa auth)
-const char* MQTT_PASS = "password";       // contraseña del broker
+const char* MQTT_PASS = "contrasena";       // contraseña del broker
 
 const int PUBLISH_MS  = 2000;
 #define   RESET_PIN   0
@@ -112,7 +112,7 @@ double MIC_OFFSET_DB = MIC_OFFSET_DEFAULT;
 
 // Credenciales de la página de calibración (HTTP Basic Auth)
 const char* CAL_USER = "admin";
-const char* CAL_PASS = "password";   // cambiar por seguridad
+const char* CAL_PASS = "calibrar";   // cambiar por seguridad
 
 // Con muestras normalizadas a -1.0..+1.0, MIC_REF_AMPL no lleva el factor entero
 const double MIC_REF_AMPL = pow(10.0, MIC_SENSITIVITY / 20.0);
@@ -141,6 +141,33 @@ const double MIC_REF_AMPL = pow(10.0, MIC_SENSITIVITY / 20.0);
 const double FILTER_G_TOTAL  = 0.170331257066098;
 const double FILTER_G_TOTAL2 = 0.029012737133717;   // G_TOTAL^2, para sum_sqr
 
+// ── PONDERACIÓN TEMPORAL "FAST" (τ=125ms, IEC 61672-1) ────
+// El "pico máximo" se calculaba como la muestra cruda de mayor amplitud
+// dentro de un bloque de 125ms, sin ningún filtrado. Una sola muestra
+// anómala (glitch de EMI, autoruido del micrófono) disparaba un "pico"
+// alto aunque no hubiera un evento sonoro real.
+//
+// La normativa (IEC 61672-1, base de las ordenanzas de ruido) no mide así:
+// define Lmax/LAFmax como el máximo de una envolvente de potencia con
+// ponderación temporal "Fast", constante de tiempo τ=125ms, es decir un
+// filtro paso-bajo exponencial continuo sobre la señal al cuadrado.
+// Un evento de 1 muestra pesa ~1/6000 en esa media exponencial (no mueve
+// nada); un evento sostenido (varios cientos de ms) sí eleva la
+// envolvente de forma perceptible. Esto separa eventos reales de
+// artefactos del sensor.
+//
+// alpha = dt/tau = (1/48000) / 0.125 = 1/6000, en Q28 (mismo formato que
+// los filtros IIR, coste extra de CPU marginal: una multiplicación int64
+// más por muestra).
+const int64_t ALPHA_FAST_Q28 = 44739;   // round((1.0/6000.0) * (1LL<<28))
+
+// ── INSTRUMENTACIÓN DE DIAGNÓSTICO ────────────────────
+// Pon esto a 0 antes de un despliegue definitivo/desatendido: evita el
+// Serial.printf de [TIMING] y el riesgo de que el USB-CDC nativo de
+// algunos ESP32 se comporte de forma rara sin un host leyendo el puerto.
+// Ponlo a 1 mientras estés validando con el monitor serie abierto.
+#define DEBUG_TIMING 1
+
 struct biquad_i_t {          // coeficientes Q28; b0 = 1.0 implícito
   int32_t b1, b2, a1, a2;
 };
@@ -158,8 +185,14 @@ const biquad_i_t Aw_sos[3] = {
 // Estados DF1 por etapa: {x1, x2, y1, y2}. 4 etapas.
 int32_t filtro_st[4][4] = {{0}};
 
+// Envolvente de potencia "Fast" (τ=125ms), continua muestra a muestra.
+// IMPORTANTE: NO se resetea por bloque, solo al iniciar/reiniciar el
+// sensor -- es un filtro continuo, igual que en un sonómetro real.
+int64_t env_fast_i = 0;
+
 void resetFiltros() {
   memset(filtro_st, 0, sizeof(filtro_st));
+  env_fast_i = 0;
 }
 
 // Biquad en punto fijo, Direct Form I (la forma recomendada en entero:
@@ -474,6 +507,11 @@ void conectarMQTT() {
 }
 
 void publicarMedicion(double leq, double peak, double minDb) {
+  // NOTA: "peak" es LAFmax (máximo con ponderación temporal Fast,
+  // τ=125ms, IEC 61672-1) durante el intervalo de publicación. No es la
+  // muestra cruda de mayor amplitud, que es sensible a glitches del
+  // sensor. El nombre del campo JSON se mantiene por compatibilidad con
+  // dashboards existentes, aunque el significado ahora es el normativo.
   if (!mqttClient.connected()) return;
 
   StaticJsonDocument<200> doc;
@@ -552,6 +590,7 @@ void mic_reader_task(void* param) {
     // ── INSTRUMENTACIÓN: detectar pérdida de muestras / saturación CPU ──
     // Un bloque de 6000 muestras a 48kHz debe llegar cada 125.0 ms exactos.
     // Si el ciclo real es mayor, el DMA se está desbordando y PERDEMOS audio.
+#if DEBUG_TIMING
     static unsigned long t_ciclo_prev = 0;
     static uint32_t nbloques = 0;
     static uint32_t ciclo_acum_us = 0, filtro_acum_us = 0;
@@ -562,29 +601,43 @@ void mic_reader_task(void* param) {
     t_ciclo_prev = t0;
 
     if (bytes_read != SAMPLES_SHORT * sizeof(int32_t)) bytes_cortos++;
+#endif
 
     int32_t* raw = (int32_t*)samples_buf;
 
     // Procesado 100% en enteros (el C3 no tiene FPU): acumulador de
-    // energía en int64 y pico en int32. Ni una operación float por muestra.
+    // energía en int64 y envolvente Fast (para LAFmax) en int64.
+    // Ni una operación float por muestra.
     int64_t sum_sqr_i = 0;
-    int32_t pico_i    = 0;
+    int64_t env_max_i = 0;   // máximo de la envolvente Fast en este bloque
 
     for (int i = 0; i < SAMPLES_SHORT; i++) {
       // Descartar los 8 bits bajos (relleno) -> muestra de 24 bits útiles
       int32_t muestra24 = raw[i] >> 8;
       int32_t a = aplicarFiltrosInt(muestra24);
-      sum_sqr_i += (int64_t)a * a;
-      int32_t abs_a = (a < 0) ? -a : a;
-      if (abs_a > pico_i) pico_i = abs_a;
+      int64_t a_sq = (int64_t)a * a;
+      sum_sqr_i += a_sq;
+
+      // Envolvente Fast (IEC 61672-1): filtro paso-bajo exponencial de
+      // τ=125ms sobre la potencia, continuo entre bloques. Un glitch de
+      // 1 muestra apenas la mueve; un evento sostenido sí.
+      env_fast_i += ((a_sq - env_fast_i) * ALPHA_FAST_Q28) >> FQ;
+      if (env_fast_i > env_max_i) env_max_i = env_fast_i;
     }
 
     // Conversión a escala normalizada (-1..+1) y ganancia escalar de los
     // filtros, UNA sola vez por bloque (aquí sí usamos float/double).
     const double ESC = 8388608.0;                     // 2^23
     double sum  = ((double)sum_sqr_i / (ESC * ESC)) * FILTER_G_TOTAL2;
-    float  pico = (float)(((double)pico_i / ESC) * FILTER_G_TOTAL);
 
+    // env_max_i está en escala de POTENCIA (igual que sum_sqr_i): se
+    // normaliza igual, con la ganancia al cuadrado (FILTER_G_TOTAL2), NO
+    // con la ganancia lineal -- así el pico usa la misma "vara de medir"
+    // que el Leq, y la conversión a dB más abajo usa 10*log10 (potencia)
+    // en vez de 20*log10 (amplitud).
+    float  pico = (float)(((double)env_max_i / (ESC * ESC)) * FILTER_G_TOTAL2);
+
+#if DEBUG_TIMING
     filtro_acum_us += (uint32_t)(micros() - t0);
     nbloques++;
 
@@ -597,6 +650,7 @@ void mic_reader_task(void* param) {
       nbloques = 0; ciclo_acum_us = 0; filtro_acum_us = 0;
       t_ciclo_prev = 0;
     }
+#endif
     // ── FIN INSTRUMENTACIÓN ──
 
     MedicionBloque bloque = { sum, pico };
@@ -805,8 +859,11 @@ void loop() {
     double rms_db = MIC_OFFSET_DB + MIC_REF_DB +
                     20.0 * log10(sqrt(bloque.sum_sqr / SAMPLES_SHORT) / MIC_REF_AMPL + 1e-10);
 
+    // LAFmax del bloque: bloque.peak ya es la envolvente Fast en escala de
+    // POTENCIA (como sum_sqr), por eso aquí es 10*log10 con REF^2, igual
+    // que se haría para pasar de potencia a dB en cualquier sonómetro.
     double pico_db = MIC_OFFSET_DB + MIC_REF_DB +
-                     20.0 * log10((double)bloque.peak / MIC_REF_AMPL + 1e-10);
+                     10.0 * log10((double)bloque.peak / (MIC_REF_AMPL * MIC_REF_AMPL) + 1e-20);
 
     // Acumular solo si está en rango válido
     if (rms_db >= MIC_NOISE_DB && rms_db <= MIC_OVERLOAD_DB) {
