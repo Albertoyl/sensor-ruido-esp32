@@ -1,8 +1,8 @@
 # Sensor de Ruido IoT — ESP32-C3
 
 Sonómetro de bajo coste basado en ESP32-C3 y micrófono I2S MEMS (INMP441 /
-ICS-4343x). Mide el nivel sonoro con ponderación A (LAeq), publica las medidas
-por MQTT y ofrece una página web para su calibración.
+ICS-4343x). Mide el nivel sonoro con ponderación A (LAeq y LAFmax), publica
+las medidas por MQTT y ofrece una página web para su calibración.
 
 ## Autoría
 
@@ -37,7 +37,12 @@ Aportaciones originales de Alberto Yubero López / AVUDS:
 - **Portal de configuración WiFi** (WiFiManager), **publicación MQTT** y
   descubrimiento **mDNS**.
 - Gestión de credenciales en NVS, reinicio por doble arranque e instrumentación
-  de diagnóstico (timing de ciclo/filtrado).
+  de diagnóstico (timing de ciclo/filtrado, desactivable con `DEBUG_TIMING`).
+- **Cálculo del pico ("Lmax") con ponderación temporal Fast (τ=125ms, según
+  IEC 61672-1)** en vez de la muestra cruda de mayor amplitud: se implementó
+  una envolvente de potencia con filtro exponencial continuo en punto fijo
+  (Q28), que evita que un glitch de una sola muestra (EMI, autoruido del
+  micrófono) se reporte como un pico sonoro real.
 
 ## Hardware
 
